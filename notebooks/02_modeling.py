@@ -124,6 +124,49 @@ print(confusion_matrix(test_df["target"], test_pred))
 
 # COMMAND ----------
 
+from sklearn.model_selection import GridSearchCV
+
+# Tune on a sample of the training set (faster). The test set stays untouched.
+tuning_df = train_df.sample(n=100000, random_state=SEED)
+
+param_grids = {
+    "logistic": {"model__C": [0.01, 0.1, 1, 10]},
+    "hist_gradient_boosting": {
+        "model__max_depth": [3, 5],
+        "model__learning_rate": [0.05, 0.1],
+        "model__l2_regularization": [0.0, 1.0],
+    },
+}
+
+best_params = {}
+for model_name, param_grid in param_grids.items():
+    search = GridSearchCV(
+        build_model_pipeline(model_name), param_grid,
+        scoring="roc_auc", cv=GroupKFold(n_splits=3),
+        return_train_score=True, n_jobs=1,
+    )
+    search.fit(tuning_df[feature_columns], tuning_df["target"], groups=tuning_df["id_municipio"])
+
+    best_index = search.best_index_
+    best_params[model_name] = search.best_params_
+    print(model_name)
+    print("  best params:", search.best_params_)
+    print("  train AUC:", round(search.cv_results_["mean_train_score"][best_index], 3))
+    print("  valid AUC:", round(search.cv_results_["mean_test_score"][best_index], 3))
+
+# COMMAND ----------
+
+# Refit each tuned model on the full training set and compare on held-out municipalities
+for model_name, params in best_params.items():
+    tuned_pipeline = build_model_pipeline(model_name).set_params(**params)
+    tuned_pipeline.fit(train_df[feature_columns], train_df["target"])
+    tuned_proba = tuned_pipeline.predict_proba(test_df[feature_columns])[:, 1]
+    print(model_name, "test AUC:", round(roc_auc_score(test_df["target"], tuned_proba), 3))
+
+print("untuned logistic test AUC:", round(roc_auc_score(test_df["target"], test_proba), 3))
+
+# COMMAND ----------
+
 # Out-of-fold probabilities on the training set, grouped by municipality
 valid_proba = cross_val_predict(
     build_model_pipeline("logistic"),
