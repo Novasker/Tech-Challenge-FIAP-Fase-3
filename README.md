@@ -1,108 +1,140 @@
-# Tech Challenge - Fase 2
-## Pipeline Híbrido para Análise da Alfabetização no Brasil
+# Tech Challenge - Fase 3
+## Predição e Inteligência Analítica para Alfabetização no Brasil
 
-Projeto da Fase 2 do curso, que consiste em construir uma pipeline de dados na nuvem (usamos Azure Databricks) para integrar dados públicos sobre alfabetização infantil no Brasil, usando a base do Indicador Criança Alfabetizada disponível na plataforma Base dos Dados.
+Nesta fase usamos a camada Gold construída na Fase 2 para treinar um modelo que prevê se um aluno do 2º ano é alfabetizado ou não, e para analisar quais municípios e regiões estão mais longe da meta de 2030.
 
-## Contexto
+## 1. Contexto do problema
 
-O Compromisso Nacional Criança Alfabetizada é uma política pública que busca garantir que todas as crianças brasileiras estejam alfabetizadas até o fim do 2º ano do ensino fundamental. Em 2023 o INEP fez uma pesquisa (Alfabetiza Brasil) e definiu que uma criança é considerada alfabetizada quando atinge 743 pontos na escala de proficiência do Saeb. A partir disso foi criado o Indicador Criança Alfabetizada, que mostra o percentual de alunos que atingem esse patamar, com meta de chegar a 100% até 2030.
+O Compromisso Nacional Criança Alfabetizada tem a meta de que todas as crianças estejam alfabetizadas até o fim do 2º ano do ensino fundamental, até 2030. O INEP definiu que uma criança é considerada alfabetizada quando atinge 743 pontos na escala de proficiência do Saeb.
 
-Pra entender melhor o que influencia esse indicador, é preciso juntar várias bases diferentes: metas nacionais, estaduais e municipais, dados de território, microdados dos alunos e os resultados em si. É isso que essa pipeline faz.
+Saber o número atual não basta para decidir onde agir. Quem gere a política pública precisa saber onde o problema é maior, quais fatores pesam mais e quais municípios provavelmente não vão chegar na meta se nada mudar.
 
-## Arquitetura
+## 2. Objetivo analítico
 
-Seguimos o modelo de arquitetura medalhão (bronze, silver, gold), com ingestão batch + streaming simulado.
+- Treinar um modelo supervisionado que preveja se o aluno é alfabetizado
+- Descobrir quais fatores mais pesam na predição
+- Identificar municípios com maior risco de não atingir a meta
+- Agrupar municípios com padrões parecidos
+- Registrar o que o modelo consegue e o que não consegue dizer
 
+## 3. Descrição da base
 
-### Bronze
+A base de modelagem é a tabela `gold.base_modelagem_alunos`, criada a partir da silver da Fase 2 (microdados de alunos da Base dos Dados, com o diretório de municípios do IBGE).
 
-Dados brutos, sem transformação. Ingerimos as tabelas de UF, município, as três tabelas de meta (Brasil/UF/município), a tabela de alunos (que tem quase 3,8 milhões de linhas) e uma tabela de dicionário que usamos depois pra decodificar alguns códigos. Também trouxemos a tabela de diretório de municípios (nome, região, coordenadas) pra poder enriquecer os dados depois.
+- 3.354.637 alunos do 2º ano, em 2023 e 2024
+- 5.547 municípios e 42.802 escolas
+- 59% dos alunos são alfabetizados (variável alvo `alfabetizado`)
+- Redes Municipal e Estadual (a rede Privada tinha só 24 alunos e foi removida)
 
-### Silver
+Colunas usadas: rede, estado, se o município está na Amazônia Legal, tamanho da escola e tamanho do município (número de alunos avaliados). Também testamos a taxa do município no ano anterior e a população do município (IBGE, via Base dos Dados).
 
-Aqui limpamos os dados: removemos duplicatas, padronizamos texto (tirando espaço em branco, deixando sigla de UF em maiúsculo), e um problema que demos bastante trabalho pra resolver foi que a coluna `rede` vinha como número em algumas tabelas (0, 2, 3, 5...) e como texto em outras ("Municipal", etc). Resolvemos usando a própria tabela de dicionário da Base dos Dados pra fazer esse de-para, em vez de simplesmente chutar o significado dos números.
+Decisões sobre o alvo, que são as mais importantes do projeto:
 
-Também fizemos validação de chave (conferir se todo `id_municipio` das tabelas de resultado existe na tabela de diretório) e investigamos os casos de dado ausente. Por exemplo, descobrimos que 148 municípios nunca tiveram meta municipal publicada, concentrados principalmente em SC e RS - provavelmente porque são municípios com rede municipal pequena demais pra ter uma meta calculada com significância estatística. Em vez de simplesmente deixar essas linhas com nulo sem explicação, criamos uma coluna (`possui_meta_municipal`) que marca isso de forma explícita.
+- O alvo `alfabetizado` é exatamente `proficiencia >= 743`, sem nenhuma exceção. Por isso a nota (`proficiencia`) ficou fora das variáveis: o modelo acertaria tudo sem aprender nada útil (data leakage).
+- 513.338 alunos (13,3%) não preencheram o caderno e estavam marcados como não alfabetizados. Eles não fizeram a prova, então ficaram fora do treino. Se entrassem, o modelo aprenderia a regra "não fez a prova = 0", que não tem a ver com alfabetização.
+- `presenca` e `preenchimento_caderno` também saíram, pelo mesmo motivo.
 
-Também recalculamos a taxa de alfabetização a partir dos microdados dos alunos (usando o peso amostral) só pra conferir se batia com a taxa oficial - bateu na maioria dos casos, com uma pequena divergência esperada de arredondamento.
+## 4. Etapas de modelagem
 
-### Gold
+**Análise exploratória.** Cada consulta testou uma hipótese:
 
-Três tabelas principais, que são os três exemplos que o próprio enunciado do desafio cita:
+- Território pesa muito: Ceará tem 85,0% de alfabetizados e Sergipe 34,8%. Por região, Sul 64,5%, Centro-Oeste 62,0%, Sudeste 61,3%, Nordeste 55,8% e Norte 50,9%.
+- A Amazônia Legal fica atrás: 53,5% contra 60,3% fora dela.
+- A rede pesa pouco: Estadual 62,1% e Municipal 58,8%.
+- O caderno da prova não importa: as 20 versões ficam entre 58,7% e 59,9%. A hipótese de que a dificuldade da prova explicaria a diferença foi descartada.
+- A série é a mesma para todos (2º ano), então não serve como variável.
+- A taxa do município no ano anterior tem correlação de 0,25 com o resultado do aluno em 2024.
 
-- `indicador_alfabetizacao_municipio`: indicador por município, já com a distância até a meta de 2030 calculada
-- `comparativo_meta_resultado`: compara meta com resultado, juntando Brasil, UF e município numa tabela só
-- `evolucao_temporal_indicador`: série histórica (o que já aconteceu) junto com as metas futuras, no mesmo eixo do tempo
+**Pipeline (scikit-learn).** Todo o pré-processamento está dentro do `Pipeline`, então é ajustado só com os dados de treino de cada divisão:
 
-## Sobre o streaming
+- Variáveis numéricas: imputação pela mediana, `log1p` e padronização
+- Variáveis categóricas: imputação pelo valor mais frequente e one-hot encoding (categorias novas são ignoradas)
 
-Como a Base dos Dados não tem uma fonte de dados em tempo real (é tudo publicado em lote), a parte de streaming do projeto é simulada: um notebook pega uma amostra da tabela de alunos e "solta" um lote de dados de tempos em tempos, como se fossem novas medições chegando. Outro processo (usando Auto Loader do Databricks) fica processando isso conforme chega, usando checkpoint pra não processar o mesmo arquivo duas vezes.
+**Validação e controle de leakage.**
 
-O motivo de simular em vez de usar um serviço de streaming de verdade (tipo Kafka ou Event Hub) é custo: pro volume de dados e pro propósito do projeto, não faria sentido manter uma infraestrutura de streaming rodando o tempo todo. O Auto Loader processando arquivos em intervalos (usamos o trigger `availableNow`, que processa tudo que tem e desliga) já demonstra o mesmo padrão de ingestão em tempo quase real, sem esse custo.
+- Os dados são divididos por município. Todos os alunos de um município ficam do mesmo lado, senão o modelo veria no treino alunos da mesma cidade do teste e as métricas ficariam infladas.
+- 80% dos municípios para treino e validação cruzada (5 divisões agrupadas), 20% separados para o teste final, que só foi usado no fim.
+- A taxa do município vem sempre do ano anterior, porque a taxa do mesmo ano é calculada com os próprios alunos do treino.
+- Por limite de memória do ambiente, usamos uma amostra de 15% dos alunos (cerca de 503 mil), com semente fixa (42).
 
-As análises da camada gold usam só os dados do batch (a tabela completa de alunos), não o streaming - o streaming é só pra mostrar que o pipeline consegue lidar com esse tipo de ingestão.
+**Experimentos.**
 
-## Tecnologias usadas
+- Modelo A: aluno, território e tamanhos. AUC de validação 0,630.
+- Modelo B: A mais a taxa do município no ano anterior (só 2024). AUC 0,650 na regressão logística e 0,654 no boosting. A comparação não é perfeita porque o B usa menos dados.
+- Modelo C: A mais população do município. AUC 0,630 (logística) e 0,628 (boosting). Sem ganho.
 
-- **Azure Databricks**: onde roda o processamento (Spark) e a orquestração dos jobs
-- **Delta Lake**: formato de armazenamento das tabelas, dá versionamento e transação
-- **Unity Catalog / Volumes**: usamos pra guardar os arquivos da landing zone do streaming e os checkpoints (o DBFS antigo vem desabilitado por padrão em workspace novo)
-- **google-cloud-bigquery (Python)**: pra consultar a Base dos Dados. Testamos o pacote `basedosdados` primeiro mas ele tenta abrir um navegador pra autenticar, o que não funciona dentro do Databricks - então usamos a biblioteca do Google direto, passando a credencial de forma explícita
-- **Databricks Secret Scopes**: pra guardar a chave de acesso do Google Cloud sem deixar ela em texto plano em nenhum arquivo do repositório
+**Otimização.** Testamos 4 valores de regularização (`C`) na regressão logística e 8 combinações de parâmetros no gradient boosting, com validação agrupada. O melhor `C` foi 1, o valor que já usávamos. O boosting ajustado chegou a 0,627 de AUC no teste, um ganho de 0,002 que não justifica o modelo mais complexo.
 
-## Decisões e trade-offs
+## 5. Escolha do algoritmo
 
-**Batch vs streaming**: como já expliquei acima, usamos batch pra tudo que é carga real de análise, e streaming simulado só como prova de conceito.
+Regressão logística. Ela teve o mesmo desempenho do gradient boosting na validação, é mais simples de explicar, e quase não mostra diferença entre treino e validação (0,635 contra 0,628), ou seja, não decorou os dados. O boosting decorou um pouco mais o treino sem melhorar a validação.
 
-**Data lake vs data warehouse**: optamos por manter tudo em Delta Lake (data lake) em vez de subir pra um data warehouse tradicional, porque os dados são bem heterogêneos (tabela agregada, microdados, dicionário) e o Delta já dá boa parte das garantias de um warehouse sem precisar de uma modelagem mais rígida.
+## 6. Métricas de avaliação
 
-**Custo vs performance**: particionamos a tabela de alunos por ano, já que a maioria das análises filtra por ano. Também evitamos rodar a extração do BigQuery mais de uma vez por tabela (fizemos um select, salvamos, e trabalhamos em cima do que já foi salvo), pra não gerar custo de consulta repetido no Google Cloud.
+Usamos AUC como métrica principal, porque a classe alfabetizado é maioria (59%) e a acurácia sozinha engana. Também olhamos F1, recall e precisão da classe não alfabetizado, que é a que importa para política pública.
 
-## Qualidade de dados
+Resultado no teste final, com municípios que o modelo nunca viu:
 
-Fizemos um script (`scripts/data_quality_checks.py`) com 4 tipos de verificação: duplicidade, valores ausentes, chave de relacionamento (município órfão) e consistência entre tabelas (taxa oficial vs recalculada).
+- AUC: 0,625
+- Acurácia: 0,614 (prever sempre "alfabetizado" dá 0,599)
+- Com corte de 0,5, o modelo acerta 89% dos alfabetizados, mas só 20% dos não alfabetizados
+- Com corte de 0,6, escolhido nos dados de treino: acerta 61% dos não alfabetizados (precisão de 48%) e a acurácia balanceada fica em 0,588
 
-Na última execução deu 6 verificações OK e 3 com aviso - mas as 3 já eram esperadas, porque investigamos cada uma:
-- ~310 municípios sem meta municipal em uma das colunas (os mesmos 148 municípios de SC/RS que mencionei antes, contando as duas colunas de meta separadamente)
-- 57 linhas (0,24%) de diferença entre a taxa oficial e a recalculada, dentro de uma margem aceitável de arredondamento
+Escolhemos o corte de 0,6 porque deixar passar um aluno que precisa de ajuda custa mais do que apontar um aluno a mais. O preço é uma acurácia total menor (0,58).
 
-## Monitoramento e custo (FinOps)
+## 7. Interpretação dos resultados
 
-O resultado do script de qualidade fica salvo como uma tabela Delta (`gold.data_quality_report`), então dá pra acompanhar isso ao longo do tempo, não só rodar uma vez e esquecer.
+Importância por permutação (queda de AUC ao embaralhar a variável) e SHAP concordam na ordem:
 
-Pra controlar custo: os dados ficam particionados por ano, o streaming roda como job agendado (não fica ligado direto, o que custaria mais), e não usamos nenhum serviço de mensageria pago tipo Event Hub - o Auto Loader do próprio Databricks já resolve. Os jobs agendados também podem ser pausados quando não estamos trabalhando ativamente no projeto.
+- Estado: de longe a mais importante (queda de 0,114 no AUC)
+- Tamanho do município: 0,011
+- Amazônia Legal: 0,007
+- Rede: 0,003
+- Tamanho da escola: praticamente zero
 
-## Aplicação em IA
+![Importância SHAP](images/shap_importance.png)
 
-A camada gold já foi pensada pra servir de base pra alguns usos de IA/ML no futuro:
+O estado já contém boa parte da informação da Amazônia Legal, então o peso dela pode estar parcialmente escondido dentro do estado.
 
-- Modelo pra prever quais municípios têm risco de não bater a meta de 2030, usando as variáveis territoriais que trouxemos (região, coordenadas, etc)
-- Análise de desigualdade educacional comparando região por região, usando a tabela de comparativo
-- Modelo de série temporal pra projetar a evolução do indicador e ajudar a priorizar onde investir
+## 8. Insights
 
-## Estrutura do repositório
+- O território explica muito mais do que as características da escola ou da rede. O estado onde o aluno estuda importa mais do que qualquer outra variável que testamos.
+- Tamanho da escola, população do município e versão do caderno não ajudam a prever alfabetização.
+- O histórico do município ajuda um pouco (AUC de 0,630 para 0,650).
+- Risco por município: consideramos 3.392 municípios da rede municipal com pelo menos 50 alunos avaliados nos dois anos e meta definida. Projetando a variação de 2023 para 2024 até 2030, cerca de 49,6% não atingiriam a meta. Isso varia muito por região: Sul 70,6%, Norte 57,1%, Nordeste 54,5% e Sudeste 26,4%.
+- Os 15 municípios mais distantes da meta têm taxas entre 11% e 18% e quase todos ficam no Norte e Nordeste: Bahia (6), Sergipe (4), Tocantins (3) e Amazonas (1). A exceção é Taquari, no Rio Grande do Sul.
+- Agrupamos esses municípios em 4 perfis (resultados na tabela `gold.risco_municipios`):
+  - Grupo 0, já bons (832 municípios): cerca de 84% e acima da meta
+  - Grupo 1, críticos e piorando (949): cerca de 38% e caindo 6 pontos por ano
+  - Grupo 2, em forte alta (593): subiram em média 23 pontos
+  - Grupo 3, estagnados no meio (1.018): cerca de 60%, sem mudança
+- Cerca de 44% dos municípios do Norte e do Nordeste estão no grupo crítico, contra 4% no Sudeste.
 
-```
-dashboards/
-  media_estado.png
-  media_regiao.png
-  15_piores_cidades.png
-notebooks/
-  bronze/
-    batch_ingestao.ipynb
-    streaming_alunos.ipynb
-  silver/
-    tratamento_integracao.ipynb
-  gold/
-    gold_transform.ipynb
-scripts/
-  data_quality_checks.py
-README.md
-```
+![Grupos de municípios](images/clusters.png)
 
-## Como rodar
+## 9. Limitações
 
-1. Ter um workspace Databricks no Azure com Unity Catalog habilitado
-2. Ter um projeto no Google Cloud com uma service account (papel de BigQuery Job User + Data Viewer) e a chave salva num secret scope do Databricks
-3. Rodar os notebooks na ordem: bronze (batch e depois streaming) -> silver -> gold
-4. Rodar o script de qualidade de dados depois da silver
+- O modelo é fraco para prever o aluno individual: AUC de 0,63, e com corte de 0,6 ele ainda erra mais da metade dos alertas. Serve para priorizar territórios, não para decidir sobre um aluno.
+- Os alunos do mesmo estado e rede têm quase as mesmas variáveis, então o modelo não consegue separá-los. Faltam dados do aluno, da família e da escola (infraestrutura, professores, nível socioeconômico).
+- Só existem dois anos (2023 e 2024). A variável do ano anterior só existe para 2024.
+- A projeção de risco usa só dois pontos no tempo e assume que a variação continua igual por seis anos. Ela exagera quando o resultado oscila, como no Sul, onde a média caiu de 2023 para 2024. O ranking pelas distâncias atuais é mais estável.
+- Municípios pequenos têm taxas instáveis. Por isso exigimos 50 alunos por ano, o que deixou de fora vários municípios.
+- Os alunos que não fizeram a prova (13%) ficaram de fora. Se eles tiverem um perfil diferente, as taxas aqui ficam acima das oficiais, que contam todos os matriculados.
+- As taxas não usam o peso amostral do Saeb (`peso_aluno`), então não são comparáveis com os números oficiais do MEC.
+- Treinamos com uma amostra de 15% por limite de memória.
+- As variáveis do município (tamanho, população) valem igual para todos os alunos dele.
+
+## 10. Aplicação prática para políticas públicas
+
+- Usar a lista de municípios mais distantes da meta e o grupo crítico para priorizar apoio técnico e recursos, em vez de distribuir igual.
+- Tratar cada grupo de forma diferente: manter o que funciona nos grupos bons, investigar o que mudou no grupo em alta (pode virar prática para replicar) e olhar com atenção o grupo crítico e o estagnado.
+- Acompanhar a cada ano quem sai ou entra do grupo crítico, como alerta antecipado.
+- Usar o modelo só em nível de território. Ele não deve ser usado para decidir sobre um aluno.
+
+## 11. Possíveis evoluções futuras
+
+- Incluir dados de infraestrutura e perfil das escolas (Censo Escolar), nível socioeconômico (Atlas do Desenvolvimento Humano, Cadastro Único) e financiamento (FUNDEB)
+- Usar mais anos do Saeb para validar no tempo (treinar em anos antigos e testar nos mais novos) e melhorar a projeção
+- Testar modelos que considerem a estrutura em níveis (aluno, escola, município)
+- Usar a localização (latitude e longitude do município) para capturar vizinhança
+- Calibrar as probabilidades e usar o peso amostral nas métricas
